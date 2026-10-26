@@ -13,6 +13,9 @@
 #include <fstream>
 #include <map>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static void Check(bool value, int line) {
     if (!value) {
@@ -29,6 +32,7 @@ static constexpr int ErrorEbadf = static_cast<int>(0x80020009u);
 struct Entry {
     std::uint8_t type;
     std::uint16_t recordLength;
+    std::uint32_t fileNumber = 0;
 };
 
 static int Collect(const char* buffer, int bytes, std::map<std::string, Entry>& entries) {
@@ -41,7 +45,9 @@ static int Collect(const char* buffer, int bytes, std::map<std::string, Entry>& 
         Require(name.size() == nameLength);
         Require(recordLength == ((8 + nameLength + 1 + 3) & ~3));
         Require(offset + recordLength <= bytes);
-        Require(entries.emplace(name, Entry{static_cast<std::uint8_t>(buffer[offset + 6]), recordLength}).second);
+        std::uint32_t fileNumber = 0;
+        std::memcpy(&fileNumber, buffer + offset, sizeof(fileNumber));
+        Require(entries.emplace(name, Entry{static_cast<std::uint8_t>(buffer[offset + 6]), recordLength, fileNumber}).second);
         offset += recordLength;
     }
     return records;
@@ -91,6 +97,13 @@ int main() {
     std::map<std::string, Entry> all;
     const int readAll = sceKernelGetdents(directory, large.data(), static_cast<int>(large.size()));
     Require(readAll > 0 && Collect(large.data(), readAll, all) == 6);
+#ifdef _WIN32
+    for (const auto& [name, entry] : all) {
+        FileStat status{};
+        Require(lstat_nid_postfix((root / name).string().c_str(), &status) == 0);
+        Require(entry.fileNumber != 0 && entry.fileNumber == static_cast<std::uint32_t>(status.st_ino));
+    }
+#endif
     Require(sceKernelGetdents(directory, large.data(), static_cast<int>(large.size())) == 0);
 
     Require(sceKernelLseek(directory, 0, 0) == 0);
@@ -136,4 +149,39 @@ int main() {
     Require(sceKernelPread(file, bytes, 1, 0) == ErrorEbadf);
 
     std::filesystem::remove_all(root);
+
+#ifdef _WIN32
+    const auto numbered = std::filesystem::path("anyps5-directory-numbers-test-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directory(numbered));
+    { std::ofstream stream(numbered / "target.bin", std::ios::binary); stream << "x"; }
+    { std::ofstream stream(numbered / std::filesystem::path(u8"caf\u00e9.txt"), std::ios::binary); stream << "x"; }
+    { std::ofstream stream(numbered / std::filesystem::path(u8"\u65e5\u672c.txt"), std::ios::binary); stream << "x"; }
+    const bool linked = CreateSymbolicLinkW((numbered / "file-link").c_str(), L"target.bin", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0;
+    const int numberedDirectory = sceKernelOpen(numbered.string().c_str(), SCE_KERNEL_O_RDONLY | SCE_KERNEL_O_DIRECTORY, 0);
+    Require(numberedDirectory >= 0);
+    const auto readNumbers = [&] {
+        std::map<std::string, Entry> found;
+        Require(sceKernelLseek(numberedDirectory, 0, 0) == 0);
+        const int listed = sceKernelGetdents(numberedDirectory, large.data(), static_cast<int>(large.size()));
+        Require(listed > 0);
+        Collect(large.data(), listed, found);
+        for (const auto& [name, entry] : found) {
+            FileStat status{};
+            Require(lstat_nid_postfix((numbered / name).string().c_str(), &status) == 0);
+            Require(entry.fileNumber != 0 && entry.fileNumber == static_cast<std::uint32_t>(status.st_ino));
+        }
+        return found;
+    };
+    const auto before = readNumbers();
+    Require(before.contains("caf\xc3\xa9.txt") && before.contains("\xe6\x97\xa5\xe6\x9c\xac.txt"));
+    if (linked) Require(before.at("file-link").fileNumber != before.at("target.bin").fileNumber);
+    { std::ofstream stream(numbered / "added.bin", std::ios::binary); stream << "x"; }
+    const auto after = readNumbers();
+    Require(after.contains("added.bin"));
+    for (const auto& [name, entry] : before) Require(after.at(name).fileNumber == entry.fileNumber);
+    Require(sceKernelClose(numberedDirectory) == 0);
+    if (linked) Require(DeleteFileW((numbered / "file-link").c_str()) != 0);
+    std::filesystem::remove_all(numbered);
+#endif
 }

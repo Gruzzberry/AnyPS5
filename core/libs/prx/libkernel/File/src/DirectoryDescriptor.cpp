@@ -11,6 +11,7 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libc/include/WindowsDescriptor.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -36,9 +38,15 @@ constexpr std::uint8_t GuestDirectoryType = 4;
 constexpr std::uint8_t GuestRegularType = 8;
 constexpr std::uint8_t GuestSymbolicLinkType = 10;
 
+struct DirectoryEntry {
+    std::string name;
+    std::uint8_t type;
+    std::uint32_t number;
+};
+
 struct DirectoryState {
     std::mutex mutex;
-    std::vector<std::pair<std::string, std::uint8_t>> entries;
+    std::vector<DirectoryEntry> entries;
     std::size_t cursor = 0;
     bool loaded = false;
 };
@@ -99,6 +107,32 @@ std::uint8_t EntryType(const std::filesystem::path& path, bool followLinks) {
     }
 }
 
+std::map<std::string, std::uint32_t> FileNumbers(const std::filesystem::path& directory) {
+    std::map<std::string, std::uint32_t> numbers;
+    const HANDLE handle = CreateFileW(directory.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return numbers;
+    struct HandleCloser {
+        HANDLE handle;
+        ~HandleCloser() { CloseHandle(handle); }
+    } closer{handle};
+    alignas(8) std::byte buffer[65536];
+    bool restart = true;
+    while (GetFileInformationByHandleEx(handle, restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo, buffer, sizeof(buffer))) {
+        restart = false;
+        for (const std::byte* record = buffer;;) {
+            const auto* information = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(record);
+            const std::wstring name(information->FileName, information->FileNameLength / sizeof(WCHAR));
+            const auto utf8 = std::filesystem::path(name).u8string();
+            if (information->FileId.QuadPart != 0)
+                numbers[std::string(utf8.begin(), utf8.end())] = WindowsFileNumber_nid_no_patch(static_cast<std::uint64_t>(information->FileId.QuadPart));
+            if (information->NextEntryOffset == 0) break;
+            record += information->NextEntryOffset;
+        }
+    }
+    return numbers;
+}
+
 void Load(DirectoryState& state, int fd) {
     if (state.loaded) return;
     const auto path = File::WindowsDescriptorPath_nid_no_patch(fd);
@@ -106,10 +140,18 @@ void Load(DirectoryState& state, int fd) {
     const int savedErrno = errno;
     const bool followLinks = InsideApp0(*path);
     errno = savedErrno;
-    std::vector<std::pair<std::string, std::uint8_t>> entries{{".", GuestDirectoryType}, {"..", GuestDirectoryType}};
+    const auto numbers = FileNumbers(*path);
+    std::vector<DirectoryEntry> entries;
+    const auto add = [&](const std::string& name, const std::string& key, std::uint8_t type) {
+        const auto found = numbers.find(key);
+        entries.push_back({name, type, found != numbers.end() ? found->second : static_cast<std::uint32_t>(entries.size() + 1)});
+    };
+    add(".", ".", GuestDirectoryType);
+    add("..", "..", GuestDirectoryType);
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(*path, error)) {
-        entries.emplace_back(entry.path().filename().string(), EntryType(entry.path(), followLinks));
+        const auto utf8 = entry.path().filename().u8string();
+        add(entry.path().filename().string(), std::string(utf8.begin(), utf8.end()), EntryType(entry.path(), followLinks));
     }
     state.entries = std::move(entries);
     state.loaded = true;
@@ -227,7 +269,7 @@ int ReadDirectoryDescriptor(int fd, char* buf, int nbytes, std::int64_t* base) {
     if (base != nullptr) *base = static_cast<std::int64_t>(state.cursor);
     std::size_t used = 0;
     while (state.cursor < state.entries.size()) {
-        const auto& [name, type] = state.entries[state.cursor];
+        const auto& [name, type, number] = state.entries[state.cursor];
         if (name.size() > 255) {
             throw std::runtime_error("Directory entry name exceeds the guest 255-byte limit");
         }
@@ -238,7 +280,7 @@ int ReadDirectoryDescriptor(int fd, char* buf, int nbytes, std::int64_t* base) {
         }
         char* out = buf + used;
         std::memset(out, 0, record);
-        const auto fileNumber = static_cast<std::uint32_t>(state.cursor + 1);
+        const std::uint32_t fileNumber = number;
         const auto recordLength = static_cast<std::uint16_t>(record);
         std::memcpy(out, &fileNumber, sizeof(fileNumber));
         std::memcpy(out + 4, &recordLength, sizeof(recordLength));
