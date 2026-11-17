@@ -581,6 +581,31 @@ class DebtSplitTests(unittest.TestCase):
     def test_separated_puts_a_blank_between_entries_and_text(self):
         self.assertEqual(debt_split.separated(["- a", "- b", "text"]), ["- a", "- b", "", "text"])
 
+    def test_render_orders_sections_and_puts_unknown_last(self):
+        sections = {"Zed": ["- z"], "Beta": ["- b1", "- b2"], "Alpha": ["- a"]}
+        self.assertEqual(
+            debt_split.render("# T", sections, ["Beta", "Alpha"]),
+            "# T\n\n### Beta\n\n- b1\n- b2\n\n### Alpha\n\n- a\n\n### Zed\n\n- z\n",
+        )
+
+    def test_render_places_preamble_before_sections(self):
+        self.assertEqual(
+            debt_split.render("# T", {"A": ["- a"]}, ["A"], ["note"]),
+            "# T\n\nnote\n\n### A\n\n- a\n",
+        )
+
+    def test_sections_of_lists_section_headings(self):
+        text = "# T\n\n### One\n\n- a\n\n### Two\n"
+        self.assertEqual(debt_split.sections_of(text), ["One", "Two"])
+
+    def test_render_index_separates_headings_and_text_with_blanks(self):
+        index = [("heading", "# T"), ("text", "intro"), ("heading", "### A"), ("entry", "- a")]
+        self.assertEqual(debt_split.render_index(index), "# T\n\nintro\n\n### A\n\n- a\n")
+
+    def test_unkeyed_drops_entries_that_have_a_debt_file(self):
+        text = "### A\n\n- plain entry\n\nsome text\n"
+        self.assertEqual(debt_split.unkeyed(text), "### A\n- plain entry\nsome text")
+
 
 if __name__ == "__main__":
     unittest.main()
