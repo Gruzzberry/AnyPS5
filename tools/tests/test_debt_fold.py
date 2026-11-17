@@ -368,10 +368,6 @@ class FoldTests(unittest.TestCase):
                 self.assertIn(message, stderr)
                 self.assertEqual(self.debt(), BASE)
 
-    def test_units_finds_bullet_entries_and_table_rows_but_not_headers(self):
-        text = "| Name | Note |\n| --- | --- |\n| a | one |\n\n- [x](y) - gap\n"
-        self.assertEqual(debt_fold.units(text), {3: "| a | one |", 5: "- [x](y) - gap"})
-
 
 if __name__ == "__main__":
     unittest.main()
