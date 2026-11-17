@@ -87,6 +87,23 @@ class Tests(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertEqual(list(self.root.iterdir()), [path])
 
+    def test_unreadable_database_is_a_usage_error(self):
+        for name, data in (("missing.json", None), ("broken.json", b"[{"), ("latin.json", b"\xff\xfe\x00")):
+            path = self.root / name
+            if data is not None:
+                path.write_bytes(data)
+            result = self.run_tool(path)
+            self.assertEqual(result.returncode, 2, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertNotEqual(result.stderr, "", name)
+
+    def test_deeply_nested_database_is_a_usage_error(self):
+        path = self.root / "deep.json"
+        path.write_text("[" * 100000, encoding="utf-8")
+        result = self.run_tool(path)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main()
